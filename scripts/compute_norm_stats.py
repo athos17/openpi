@@ -5,6 +5,9 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import pathlib
+
+from datasets import load_dataset
 import numpy as np
 import tqdm
 import tyro
@@ -21,6 +24,34 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
+def get_input_transforms(data_config: _config.DataConfig) -> list[transforms.DataTransformFn]:
+    repack_transforms = data_config.norm_stats_repack_transforms or data_config.repack_transforms
+    data_transforms = data_config.norm_stats_transforms or data_config.data_transforms
+    return [
+        *repack_transforms.inputs,
+        *data_transforms.inputs,
+        # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+        RemoveStrings(),
+    ]
+
+
+def _get_lerobot_parquet_data_dir(repo_id: str) -> str:
+    repo_path = pathlib.Path(repo_id)
+    data_dir = repo_path / "data"
+    return str(data_dir if data_dir.exists() else repo_path)
+
+
+def _create_raw_lerobot_dataset(data_config: _config.DataConfig) -> _data_loader.Dataset:
+    if data_config.repo_id is None:
+        raise ValueError("Data config must have a repo_id")
+
+    dataset = load_dataset("parquet", data_dir=_get_lerobot_parquet_data_dir(data_config.repo_id), split="train")
+    if data_config.prompt_from_task:
+        dataset_meta = _data_loader.lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+        dataset = _data_loader.TransformedDataset(dataset, [transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    return dataset
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -31,15 +62,14 @@ def create_torch_dataloader(
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    if data_config.norm_stats_transforms is not None:
+        del action_horizon, model_config
+        dataset = _create_raw_lerobot_dataset(data_config)
+    else:
+        dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+        get_input_transforms(data_config),
     )
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
@@ -66,12 +96,7 @@ def create_rlds_dataloader(
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+        get_input_transforms(data_config),
         is_batched=True,
     )
     if max_frames is not None and max_frames < len(dataset):
@@ -84,6 +109,12 @@ def create_rlds_dataloader(
         num_batches=num_batches,
     )
     return data_loader, num_batches
+
+
+def get_output_path(assets_dirs, data_config: _config.DataConfig):
+    if data_config.asset_id is None:
+        raise ValueError("Data config must set asset_id before writing normalization stats.")
+    return assets_dirs / data_config.asset_id
 
 
 def main(config_name: str, max_frames: int | None = None):
@@ -108,7 +139,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = get_output_path(config.assets_dirs, data_config)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

@@ -62,6 +62,29 @@ def test_with_fake_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
+def test_create_torch_dataset_passes_lerobot_tolerance(monkeypatch):
+    captured = {}
+
+    class FakeMetadata:
+        fps = 30
+
+    class FakeLeRobotDataset:
+        def __init__(self, repo_id, **kwargs):
+            captured["repo_id"] = repo_id
+            captured.update(kwargs)
+
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", lambda repo_id: FakeMetadata())
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", FakeLeRobotDataset)
+
+    data_config = _config.DataConfig(repo_id="local/wuji", action_sequence_keys=("action",), lerobot_tolerance_s=0.015)
+
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon=16, model_config=pi0_config.Pi0Config())
+
+    assert isinstance(dataset, FakeLeRobotDataset)
+    assert captured["repo_id"] == "local/wuji"
+    assert captured["tolerance_s"] == 0.015
+
+
 def test_with_real_dataset():
     config = _config.get_config("pi0_aloha_sim")
     config = dataclasses.replace(config, batch_size=4)
