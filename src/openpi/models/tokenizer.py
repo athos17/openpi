@@ -1,5 +1,6 @@
 import logging
 import os
+import string
 
 import jax
 import numpy as np
@@ -12,12 +13,26 @@ import openpi.shared.download as download
 
 
 class PaligemmaTokenizer:
-    def __init__(self, max_len: int = 48):
+    def __init__(self, max_len: int = 48, fast_tokenizer_path: str | None = None):
         self._max_len = max_len
+        self._fast_tokenizer = None
+        self._fast_skip_tokens = 128
 
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        if fast_tokenizer_path is not None:
+            try:
+                self._fast_tokenizer = AutoProcessor.from_pretrained(
+                    fast_tokenizer_path,
+                    trust_remote_code=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"FAST tokenizer is required but could not be loaded from {fast_tokenizer_path!r}. "
+                    "Install or cache the tokenizer locally, or set fast_token_loss_weight=0."
+                ) from exc
 
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
@@ -46,6 +61,141 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+
+    def tokenize_high_low_prompt(
+        self,
+        high_prompt: str,
+        low_prompt: str,
+        state: np.ndarray,
+        actions: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_high_text = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        cleaned_low_text = low_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+
+        if cleaned_high_text and cleaned_high_text[-1] in string.punctuation:
+            cleaned_high_text = cleaned_high_text[:-1]
+        cleaned_high_text += "."
+
+        prompt_1 = f"Task: {cleaned_high_text}; State: {state_str}; Subtask: "
+        tokens_1 = self._tokenizer.encode(prompt_1, add_bos=True)
+        ar_mask = [True] * len(tokens_1)
+        loss_mask = [False] * len(tokens_1)
+        subtask_region_mask = [False] * len(tokens_1)
+        action_region_mask = [False] * len(tokens_1)
+
+        if cleaned_low_text and cleaned_low_text[-1] in string.punctuation:
+            cleaned_low_text = cleaned_low_text[:-1]
+        cleaned_low_text += "."
+
+        if actions is None or self._fast_tokenizer is None:
+            prompt_2 = f"{cleaned_low_text};\nAction: "
+            tokens_2 = self._tokenizer.encode(prompt_2, add_eos=True)
+        else:
+            prompt_2 = f"{cleaned_low_text};"
+            tokens_2 = self._tokenizer.encode(prompt_2)
+
+        ar_mask += [True] * len(tokens_2)
+        loss_mask += [True] * len(tokens_2)
+        subtask_region_mask += [True] * len(tokens_2)
+        action_region_mask += [False] * len(tokens_2)
+        tokens = tokens_1 + tokens_2
+
+        if actions is not None and self._fast_tokenizer is not None:
+            action_tokens_fast = self._fast_tokenizer(actions[None])[0]
+            action_tokens_pg = self._act_tokens_to_paligemma_tokens(action_tokens_fast)
+            action_seq = (
+                self._tokenizer.encode("\nAction: ")
+                + action_tokens_pg.tolist()
+                + self._tokenizer.encode("|", add_eos=True)
+            )
+            tokens += action_seq
+            ar_mask += [True] * len(action_seq)
+            loss_mask += [True] * len(action_seq)
+            subtask_region_mask += [False] * len(action_seq)
+            action_region_mask += [True] * len(action_seq)
+
+        return self._pad_high_low_tokens(tokens, ar_mask, loss_mask, subtask_region_mask, action_region_mask)
+
+    def tokenize_high_low_prompt_infer(
+        self,
+        high_prompt: str,
+        state: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_high_text = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+
+        if cleaned_high_text and cleaned_high_text[-1] in string.punctuation:
+            cleaned_high_text = cleaned_high_text[:-1]
+        cleaned_high_text += "."
+
+        prompt = f"Task: {cleaned_high_text}; State: {state_str}; Subtask: "
+        tokens = self._tokenizer.encode(prompt, add_bos=True)
+        ar_mask = [True] * len(tokens)
+        loss_mask = [False] * len(tokens)
+
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            token_mask = [True] * tokens_len + padding
+            tokens = tokens + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    f"Token length ({tokens_len}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = [True] * self._max_len
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return (
+            np.asarray(tokens),
+            np.asarray(token_mask),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask),
+        )
+
+    def _pad_high_low_tokens(self, tokens, ar_mask, loss_mask, subtask_region_mask, action_region_mask):
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            mask = [True] * tokens_len + padding
+            tokens = tokens + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+            subtask_region_mask = subtask_region_mask + padding
+            action_region_mask = action_region_mask + padding
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    f"Token length ({tokens_len}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+            subtask_region_mask = subtask_region_mask[: self._max_len]
+            action_region_mask = action_region_mask[: self._max_len]
+        return (
+            np.asarray(tokens),
+            np.asarray(mask),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask),
+            np.asarray(subtask_region_mask),
+            np.asarray(action_region_mask),
+        )
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
 
 
 class FASTTokenizer:

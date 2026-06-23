@@ -1,12 +1,57 @@
 from flax import nnx
 import jax
+import numpy as np
 import pytest
+import torch
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
+from openpi.models_pytorch import preprocessing_pytorch
 from openpi.shared import download
 from openpi.shared import nnx_utils
+
+
+def _observation_dict():
+    return {
+        "image": {
+            "base_0_rgb": np.zeros((1, 224, 224, 3), dtype=np.float32),
+            "left_wrist_0_rgb": np.zeros((1, 224, 224, 3), dtype=np.float32),
+            "right_wrist_0_rgb": np.zeros((1, 224, 224, 3), dtype=np.float32),
+        },
+        "image_mask": {
+            "base_0_rgb": np.array([True]),
+            "left_wrist_0_rgb": np.array([True]),
+            "right_wrist_0_rgb": np.array([True]),
+        },
+        "state": np.zeros((1, 58), dtype=np.float32),
+        "tokenized_prompt": np.zeros((1, 8), dtype=np.int32),
+        "tokenized_prompt_mask": np.ones((1, 8), dtype=bool),
+        "subtask_region_mask": np.array([[False, True, True, False, False, False, False, False]]),
+        "action_region_mask": np.array([[False, False, False, True, True, False, False, False]]),
+    }
+
+
+def test_observation_from_dict_preserves_subtask_region_masks():
+    obs = _model.Observation.from_dict(_observation_dict())
+
+    assert obs.subtask_region_mask.tolist() == [[False, True, True, False, False, False, False, False]]
+    assert obs.action_region_mask.tolist() == [[False, False, False, True, True, False, False, False]]
+    assert obs.to_dict()["subtask_region_mask"].tolist() == obs.subtask_region_mask.tolist()
+    assert obs.to_dict()["action_region_mask"].tolist() == obs.action_region_mask.tolist()
+
+
+def test_preprocess_observation_pytorch_preserves_subtask_region_masks():
+    batch = {
+        key: torch.as_tensor(value) if not isinstance(value, dict) else {k: torch.as_tensor(v) for k, v in value.items()}
+        for key, value in _observation_dict().items()
+    }
+    obs = _model.Observation.from_dict(batch)
+
+    processed = preprocessing_pytorch.preprocess_observation_pytorch(obs, train=False)
+
+    assert torch.equal(processed.subtask_region_mask, obs.subtask_region_mask)
+    assert torch.equal(processed.action_region_mask, obs.action_region_mask)
 
 
 def test_pi0_model():

@@ -267,6 +267,38 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeHighLowPrompt(DataTransformFn):
+    tokenizer: _tokenizer.PaligemmaTokenizer
+    use_fast_tokens: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        high_prompt = data.pop("high_prompt", None)
+        low_prompt = data.pop("low_prompt", None)
+        if high_prompt is None or low_prompt is None:
+            raise ValueError("Both high_prompt and low_prompt are required for TokenizeHighLowPrompt")
+        if not isinstance(high_prompt, str):
+            high_prompt = high_prompt.item()
+        if not isinstance(low_prompt, str):
+            low_prompt = low_prompt.item()
+        if (state := data.get("state")) is None:
+            raise ValueError("State is required for TokenizeHighLowPrompt")
+
+        actions = data.get("actions") if self.use_fast_tokens else None
+        tokens, token_mask, ar_mask, loss_mask, subtask_region_mask, action_region_mask = (
+            self.tokenizer.tokenize_high_low_prompt(high_prompt, low_prompt, state, actions)
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+            "subtask_region_mask": subtask_region_mask,
+            "action_region_mask": action_region_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
 

@@ -62,6 +62,43 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class FilterUnlabeledSubtaskDataset(Dataset[T_co]):
+    def __init__(self, dataset: Dataset):
+        self._dataset = dataset
+        self._valid_indices = [
+            index for index, subtask_index in enumerate(self._iter_subtask_indices(dataset))
+            if self._subtask_index_is_labeled(subtask_index)
+        ]
+
+    @staticmethod
+    def _iter_subtask_indices(dataset: Dataset):
+        hf_dataset = getattr(dataset, "hf_dataset", None)
+        if hf_dataset is not None:
+            column_names = getattr(hf_dataset, "column_names", None)
+            if (column_names is None and "subtask_index" in hf_dataset) or (
+                column_names is not None and "subtask_index" in column_names
+            ):
+                return hf_dataset["subtask_index"]
+        return (dataset[index].get("subtask_index") for index in range(len(dataset)))
+
+    @staticmethod
+    def _subtask_index_is_labeled(value) -> bool:
+        array = np.asarray(value)
+        if array.shape == ():
+            scalar = array.item()
+        elif array.size == 1:
+            scalar = array.reshape(()).item()
+        else:
+            raise ValueError(f"subtask_index must be scalar-like; got shape {array.shape}")
+        return int(scalar) >= 0
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._valid_indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._valid_indices)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -148,6 +185,8 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    if data_config.filter_unlabeled_subtasks:
+        dataset = FilterUnlabeledSubtaskDataset(dataset)
 
     return dataset
 
@@ -419,14 +458,11 @@ class TorchDataLoader:
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
         if sharding is None and framework == "jax":
-            # Use data parallel sharding by default for JAX only.
-            self._sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
+            self._sharding = _default_data_sharding(local_batch_size)
         self._num_batches = num_batches
 
         mp_context = None
+        num_workers = _effective_num_workers(num_workers)
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
 
@@ -482,6 +518,42 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+
+def _effective_num_workers(num_workers: int) -> int:
+    """Disable spawned DataLoader workers when running Python code from stdin.
+
+    The spawn start method re-imports ``__main__`` from its file path. For
+    ``python -``/heredoc smoke scripts that path is ``<stdin>``, which cannot be
+    imported by child workers and leaves the parent waiting on failed workers.
+    """
+    if num_workers <= 0:
+        return 0
+
+    import __main__
+
+    main_file = getattr(__main__, "__file__", None)
+    if main_file in {None, "<stdin>"}:
+        logging.warning("Disabling DataLoader workers because __main__ is not file-backed: %s", main_file)
+        return 0
+    return num_workers
+
+
+def _default_data_sharding(local_batch_size: int) -> jax.sharding.Sharding:
+    """Return default data sharding compatible with the local batch size.
+
+    For multi-device JAX training, shard along the batch axis when the batch can
+    be evenly divided across local devices. Small smoke tests often use batch
+    sizes smaller than the visible device count; fall back to single-device
+    sharding so those batches remain valid in multi-GPU environments.
+    """
+    devices = jax.devices()
+    if len(devices) > 1 and local_batch_size % len(devices) == 0:
+        return jax.sharding.NamedSharding(
+            jax.sharding.Mesh(devices, ("B",)),
+            jax.sharding.PartitionSpec("B"),
+        )
+    return jax.sharding.SingleDeviceSharding(devices[0])
 
 
 class RLDSDataLoader:

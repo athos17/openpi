@@ -160,6 +160,70 @@ def get_model_parameters(model):
     )
 
 
+def apply_pytorch_freeze_filter(model: torch.nn.Module, freeze_filter: str | None) -> None:
+    if freeze_filter is None:
+        return
+    if freeze_filter != "vlm_except_action_expert":
+        raise ValueError(f"Unsupported pytorch_freeze_filter={freeze_filter!r}")
+
+    unwrapped = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    trainable_prefixes = (
+        "paligemma_with_expert.gemma_expert",
+        "action_in_proj",
+        "action_out_proj",
+        "time_mlp_in",
+        "time_mlp_out",
+        "action_time_mlp_in",
+        "action_time_mlp_out",
+    )
+    for name, param in unwrapped.named_parameters():
+        param.requires_grad = name.startswith(trainable_prefixes)
+
+
+def trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
+    return [param for param in model.parameters() if param.requires_grad]
+
+
+def log_trainable_parameter_counts(model: torch.nn.Module) -> None:
+    trainable = 0
+    frozen = 0
+    for param in model.parameters():
+        count = param.numel()
+        if param.requires_grad:
+            trainable += count
+        else:
+            frozen += count
+    logging.info("PyTorch parameters: trainable=%d frozen=%d", trainable, frozen)
+
+
+def create_adamw_optimizer(
+    params,
+    *,
+    lr: float,
+    betas: tuple[float, float],
+    eps: float,
+    weight_decay: float,
+) -> torch.optim.AdamW:
+    """Create AdamW with lower peak memory on CUDA.
+
+    PyTorch's foreach AdamW path allocates large temporary tensor lists, and the
+    single-tensor path materializes per-parameter denominator temporaries. Use the
+    fused CUDA implementation when all trainable parameters are on CUDA, while
+    keeping foreach disabled for CPU/tests and non-fused fallbacks.
+    """
+    param_list = list(params)
+    use_fused = bool(param_list) and all(param.is_cuda for param in param_list)
+    return torch.optim.AdamW(
+        param_list,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        foreach=False,
+        fused=use_fused,
+    )
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -395,18 +459,27 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
-        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -515,6 +588,12 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info("Loaded %d shape-compatible PyTorch tensors from %s", load_result.loaded, config.pytorch_weight_path)
 
+    apply_pytorch_freeze_filter(
+        model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model,
+        getattr(model_cfg, "pytorch_freeze_filter", None),
+    )
+    log_trainable_parameter_counts(model)
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -522,8 +601,8 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        model.parameters(),
+    optim = create_adamw_optimizer(
+        trainable_parameters(model),
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -593,14 +672,23 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-            loss = losses.mean()
+            outputs = model(observation, actions)
+            if isinstance(outputs, dict):
+                loss = outputs["loss"]
+                loss_metrics = {
+                    name: value.detach().item()
+                    for name, value in outputs.items()
+                    if torch.is_tensor(value) and value.ndim == 0
+                }
+            else:
+                losses = outputs
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = losses.mean()
+                loss_metrics = {"loss": loss.detach().item()}
 
             # Backward pass
             loss.backward()
@@ -610,7 +698,16 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters(model), max_norm=config.optimizer.clip_gradient_norm
+            )
+
+            # Release loss graph references before Adam initializes/updates optimizer state.
+            # This reduces peak memory for token+flow hybrid training where activations and
+            # full-model optimizer state otherwise overlap on the first optimizer step.
+            del outputs, loss
+            if torch.cuda.is_available() and device.type == "cuda":
+                torch.cuda.empty_cache()
 
             # Optimizer step
             optim.step()
@@ -626,7 +723,7 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        **loss_metrics,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
@@ -655,13 +752,17 @@ def train_loop(config: _config.TrainConfig):
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
-                        "loss": avg_loss,
-                        "learning_rate": avg_lr,
+                        "train/loss": avg_loss,
+                        "train/learning_rate": avg_lr,
                         "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "train/time_per_step": elapsed / config.log_interval,
                     }
+                    for key in ("flow_loss", "subtask_loss", "fast_token_loss"):
+                        vals = [info[key] for info in infos if key in info]
+                        if vals:
+                            log_payload[f"train/{key}"] = sum(vals) / len(vals)
                     if avg_grad_norm is not None:
-                        log_payload["grad_norm"] = avg_grad_norm
+                        log_payload["train/grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -675,7 +776,11 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {
+                        "loss": f"{loss_metrics.get('loss', float('nan')):.4f}",
+                        "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                        "step": global_step,
+                    }
                 )
 
     # Close progress bar

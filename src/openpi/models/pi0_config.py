@@ -32,6 +32,13 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    subtask_loss_weight: float = 0.0
+    fast_token_loss_weight: float = 0.0
+    flow_matching_loss_weight: float = 1.0
+    fast_tokenizer_path: str = "physical-intelligence/fast"
+    stop_gradient_flow_to_prefix: bool = False
+    pytorch_freeze_filter: str | None = None
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):

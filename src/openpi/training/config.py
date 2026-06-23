@@ -96,6 +96,8 @@ class DataConfig:
     prompt_from_task: bool = False
     # Timestamp synchronization tolerance for LeRobot datasets.
     lerobot_tolerance_s: float = 0.0001
+    # If true, LeRobot samples with subtask_index < 0 will be filtered out before transforms.
+    filter_unlabeled_subtasks: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -168,6 +170,25 @@ class ModelTransformFactory(GroupFactory):
                         )
                     ],
                 )
+
+
+@dataclasses.dataclass(frozen=True)
+class SubtaskModelTransformFactory(GroupFactory):
+    """Creates model transforms for hierarchical WUJI subtask training."""
+
+    def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        assert isinstance(model_config, pi0_config.Pi0Config)
+        fast_path = model_config.fast_tokenizer_path if model_config.fast_token_loss_weight > 0 else None
+        return _transforms.Group(
+            inputs=[
+                _transforms.ResizeImages(224, 224),
+                _transforms.TokenizeHighLowPrompt(
+                    _tokenizer.PaligemmaTokenizer(model_config.max_token_len, fast_tokenizer_path=fast_path),
+                    use_fast_tokens=model_config.fast_token_loss_weight > 0,
+                ),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ],
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -518,6 +539,93 @@ class LeRobotWujiDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             norm_stats_transforms=norm_stats_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+def _load_jsonl_text_map(path: pathlib.Path, *, index_key: str, text_key: str) -> dict[int, str]:
+    import json
+
+    result = {}
+    with path.open() as f:
+        for line in f:
+            item = json.loads(line)
+            result[int(item[index_key])] = str(item[text_key])
+    return result
+
+
+def _load_wuji_subtask_metadata(repo_id: str) -> tuple[dict[int, str], dict[int, str]]:
+    repo_path = pathlib.Path(repo_id)
+    tasks_path = repo_path / "meta" / "tasks.jsonl"
+    subtasks_path = repo_path / "meta" / "subtasks.jsonl"
+    if not tasks_path.exists():
+        raise FileNotFoundError(f"WUJI subtask dataset is missing {tasks_path}")
+    if not subtasks_path.exists():
+        raise FileNotFoundError(f"WUJI subtask dataset is missing {subtasks_path}")
+    return (
+        _load_jsonl_text_map(tasks_path, index_key="task_index", text_key="task"),
+        _load_jsonl_text_map(subtasks_path, index_key="subtask_index", text_key="subtask"),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotWujiSubtaskDataConfig(DataConfigFactory):
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "head_view": "observation.images.head_view",
+                            "left_wrist_view": "observation.images.left_wrist_view",
+                            "right_wrist_view": "observation.images.right_wrist_view",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "task_index": "task_index",
+                        "subtask_index": "subtask_index",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base = dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            prompt_from_task=False,
+            filter_unlabeled_subtasks=True,
+        )
+        if base.norm_stats is None:
+            fallback_asset_id = "wuji_spray_water_rot6d"
+            fallback_assets_dir = assets_dirs.parent / "pi05_wuji_spray_water_rot6d_pytorch"
+            fallback_norm_stats = self._load_norm_stats(epath.Path(fallback_assets_dir), fallback_asset_id)
+            if fallback_norm_stats is not None:
+                logging.info("Using base WUJI norm stats for WUJI subtask config.")
+                base = dataclasses.replace(base, norm_stats=fallback_norm_stats)
+
+        tasks, subtasks = _load_wuji_subtask_metadata(self.repo_id)
+        data_transforms = _transforms.Group(
+            inputs=[
+                wuji_policy.WujiSubtaskPromptsFromIndices(tasks=tasks, subtasks=subtasks),
+                wuji_policy.WujiSubtaskInputs(model_type=model_config.model_type),
+            ],
+            outputs=[wuji_policy.WujiOutputs()],
+        )
+        norm_stats_transforms = _transforms.Group(inputs=[wuji_policy.WujiNormStatsInputs()])
+        norm_stats_repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform({"state": "observation.state", "actions": "action"})]
+        )
+
+        return dataclasses.replace(
+            base,
+            repack_transforms=self.repack_transforms,
+            norm_stats_repack_transforms=norm_stats_repack_transform,
+            data_transforms=data_transforms,
+            norm_stats_transforms=norm_stats_transforms,
+            model_transforms=SubtaskModelTransformFactory()(model_config),
             action_sequence_keys=self.action_sequence_keys,
         )
 
@@ -992,6 +1100,91 @@ _CONFIGS = [
         pytorch_weight_path="./checkpoints/pi05_base_pytorch_converted",
         batch_size=16,
         num_train_steps=20_000,
+        save_interval=1000,
+    ),
+    TrainConfig(
+        name="pi05_wuji_spray_water_rot6d_subtask_flow_pytorch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=58,
+            action_horizon=16,
+            max_token_len=320,
+            subtask_loss_weight=0.15,
+            fast_token_loss_weight=0.0,
+            flow_matching_loss_weight=1.0,
+        ),
+        data=LeRobotWujiSubtaskDataConfig(
+            repo_id="/data_all/liyunhao/openpi/data/spray_water_rot6d_rosbag_ts_filter_subtask",
+            assets=AssetsConfig(asset_id="wuji_spray_water_rot6d_subtask"),
+            base_config=DataConfig(prompt_from_task=False, lerobot_tolerance_s=0.08),
+        ),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch_converted",
+        batch_size=16,
+        num_train_steps=20_000,
+        save_interval=1000,
+    ),
+    TrainConfig(
+        name="pi05_wuji_spray_water_rot6d_subtask_fast_pytorch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=58,
+            action_horizon=16,
+            max_token_len=384,
+            subtask_loss_weight=10.0,
+            fast_token_loss_weight=1.0,
+            flow_matching_loss_weight=0.0,
+        ),
+        data=LeRobotWujiSubtaskDataConfig(
+            repo_id="/data_all/liyunhao/openpi/data/spray_water_rot6d_rosbag_ts_filter_subtask",
+            assets=AssetsConfig(asset_id="wuji_spray_water_rot6d_subtask"),
+            base_config=DataConfig(prompt_from_task=False, lerobot_tolerance_s=0.08),
+        ),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch_converted",
+        batch_size=16,
+        num_train_steps=20_000,
+        save_interval=1000,
+    ),
+    TrainConfig(
+        name="pi05_wuji_spray_water_rot6d_action_expert_pytorch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=58,
+            action_horizon=16,
+            max_token_len=320,
+            subtask_loss_weight=0.0,
+            fast_token_loss_weight=0.0,
+            flow_matching_loss_weight=1.0,
+            pytorch_freeze_filter="vlm_except_action_expert",
+        ),
+        data=LeRobotWujiSubtaskDataConfig(
+            repo_id="/data_all/liyunhao/openpi/data/spray_water_rot6d_rosbag_ts_filter_subtask",
+            assets=AssetsConfig(asset_id="wuji_spray_water_rot6d_subtask"),
+            base_config=DataConfig(prompt_from_task=False, lerobot_tolerance_s=0.08),
+        ),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch_converted",
+        batch_size=16,
+        num_train_steps=8_000,
+        save_interval=1000,
+    ),
+    TrainConfig(
+        name="pi05_wuji_spray_water_rot6d_subtask_hybrid_pytorch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=58,
+            action_horizon=16,
+            max_token_len=384,
+            subtask_loss_weight=0.15,
+            fast_token_loss_weight=0.15,
+            flow_matching_loss_weight=1.0,
+        ),
+        data=LeRobotWujiSubtaskDataConfig(
+            repo_id="/data_all/liyunhao/openpi/data/spray_water_rot6d_rosbag_ts_filter_subtask",
+            assets=AssetsConfig(asset_id="wuji_spray_water_rot6d_subtask"),
+            base_config=DataConfig(prompt_from_task=False, lerobot_tolerance_s=0.08),
+        ),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch_converted",
+        batch_size=16,
+        num_train_steps=40_000,
         save_interval=1000,
     ),
     #

@@ -1,6 +1,7 @@
 import dataclasses
 
 import jax
+import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -32,6 +33,66 @@ def test_torch_data_loader_infinite():
 
     for _ in range(10):
         _ = next(data_iter)
+
+
+class _TinySubtaskDataset:
+    def __init__(self):
+        self.items = [
+            {"subtask_index": -1, "value": "drop"},
+            {"subtask_index": 0, "value": "keep0"},
+            {"subtask_index": np.array([2]), "value": "keep2"},
+        ]
+
+    def __getitem__(self, index):
+        return self.items[int(index)]
+
+    def __len__(self):
+        return len(self.items)
+
+
+def test_filter_unlabeled_subtask_dataset_keeps_nonnegative_indices():
+    dataset = _data_loader.FilterUnlabeledSubtaskDataset(_TinySubtaskDataset())
+
+    assert len(dataset) == 2
+    assert dataset[0]["value"] == "keep0"
+    assert dataset[1]["value"] == "keep2"
+
+
+class _ColumnBackedSubtaskDataset(_TinySubtaskDataset):
+    def __init__(self):
+        super().__init__()
+        self.hf_dataset = {"subtask_index": [item["subtask_index"] for item in self.items]}
+        self.init_getitem_calls = 0
+
+    def __getitem__(self, index):
+        self.init_getitem_calls += 1
+        return super().__getitem__(index)
+
+
+def test_filter_unlabeled_subtask_dataset_uses_hf_column_without_loading_items():
+    source = _ColumnBackedSubtaskDataset()
+
+    dataset = _data_loader.FilterUnlabeledSubtaskDataset(source)
+
+    assert len(dataset) == 2
+    assert source.init_getitem_calls == 0
+    assert dataset[0]["value"] == "keep0"
+
+
+def test_effective_num_workers_disables_spawn_for_stdin_main(monkeypatch):
+    import __main__
+
+    monkeypatch.setattr(__main__, "__file__", "<stdin>", raising=False)
+
+    assert _data_loader._effective_num_workers(2) == 0
+
+
+def test_effective_num_workers_preserves_file_backed_main(monkeypatch):
+    import __main__
+
+    monkeypatch.setattr(__main__, "__file__", __file__, raising=False)
+
+    assert _data_loader._effective_num_workers(2) == 2
 
 
 def test_torch_data_loader_parallel():

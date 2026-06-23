@@ -40,6 +40,53 @@ def _require_58d(name: str, value) -> np.ndarray:
     return value
 
 
+def _to_scalar_index(name: str, value) -> int:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    array = np.asarray(value)
+    if array.shape == ():
+        value = array.item()
+    elif array.size == 1:
+        value = array.reshape(()).item()
+    else:
+        raise ValueError(f"{name} must be scalar-like; got shape {array.shape}")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return int(value)
+
+
+def _decode_prompt(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if not isinstance(value, str):
+        value = np.asarray(value).item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+    return str(value)
+
+
+@dataclasses.dataclass(frozen=True)
+class WujiSubtaskPromptsFromIndices(transforms.DataTransformFn):
+    tasks: dict[int, str]
+    subtasks: dict[int, str]
+
+    def __call__(self, data: dict) -> dict:
+        if "task_index" not in data:
+            raise ValueError('Cannot extract high_prompt without "task_index"')
+        if "subtask_index" not in data:
+            raise ValueError('Cannot extract low_prompt without "subtask_index"')
+
+        task_index = _to_scalar_index("task_index", data["task_index"])
+        subtask_index = _to_scalar_index("subtask_index", data["subtask_index"])
+        if subtask_index < 0:
+            raise ValueError(f"Cannot map unlabeled subtask_index={subtask_index}")
+        if task_index not in self.tasks:
+            raise ValueError(f"task_index={task_index} not found in task mapping: {self.tasks}")
+        if subtask_index not in self.subtasks:
+            raise ValueError(f"subtask_index={subtask_index} not found in subtask mapping: {self.subtasks}")
+        return {**data, "high_prompt": self.tasks[task_index], "low_prompt": self.subtasks[subtask_index]}
+
+
 @dataclasses.dataclass(frozen=True)
 class WujiInputs(transforms.DataTransformFn):
     # Determines which model will be used.
@@ -76,6 +123,22 @@ class WujiInputs(transforms.DataTransformFn):
             inputs["prompt"] = prompt
 
         return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class WujiSubtaskInputs(transforms.DataTransformFn):
+    # Determines which model will be used.
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        if "high_prompt" not in data or "low_prompt" not in data:
+            raise ValueError("WujiSubtaskInputs requires high_prompt and low_prompt")
+
+        base = WujiInputs(model_type=self.model_type)({**data, "prompt": data.get("prompt", "")})
+        base.pop("prompt", None)
+        base["high_prompt"] = _decode_prompt(data["high_prompt"])
+        base["low_prompt"] = _decode_prompt(data["low_prompt"])
+        return base
 
 
 @dataclasses.dataclass(frozen=True)

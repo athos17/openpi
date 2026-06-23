@@ -85,6 +85,59 @@ def test_tokenize_no_prompt():
         transform({})
 
 
+class _FakeHighLowTokenizer:
+    def tokenize_high_low_prompt(self, high_prompt, low_prompt, state, actions=None):
+        assert high_prompt == "spray water"
+        assert low_prompt == "pump"
+        assert state.shape == (58,)
+        if actions is None:
+            action_mask = np.array([False, False, False, False])
+        else:
+            action_mask = np.array([False, False, True, True])
+        return (
+            np.array([1, 2, 3, 0], dtype=np.int32),
+            np.array([True, True, True, False]),
+            np.array([1, 1, 1, 0], dtype=np.int32),
+            np.array([False, True, True, False]),
+            np.array([False, True, False, False]),
+            action_mask,
+        )
+
+
+def test_tokenize_high_low_prompt_emits_region_masks_without_fast_actions():
+    transform = _transforms.TokenizeHighLowPrompt(_FakeHighLowTokenizer(), use_fast_tokens=False)
+
+    result = transform(
+        {
+            "high_prompt": np.array("spray water"),
+            "low_prompt": np.array("pump"),
+            "state": np.zeros((58,), dtype=np.float32),
+            "actions": np.ones((16, 58), dtype=np.float32),
+        }
+    )
+
+    assert result["tokenized_prompt"].tolist() == [1, 2, 3, 0]
+    assert result["subtask_region_mask"].tolist() == [False, True, False, False]
+    assert result["action_region_mask"].tolist() == [False, False, False, False]
+    assert "high_prompt" not in result
+    assert "low_prompt" not in result
+
+
+def test_tokenize_high_low_prompt_emits_action_mask_with_fast_actions():
+    transform = _transforms.TokenizeHighLowPrompt(_FakeHighLowTokenizer(), use_fast_tokens=True)
+
+    result = transform(
+        {
+            "high_prompt": "spray water",
+            "low_prompt": "pump",
+            "state": np.zeros((58,), dtype=np.float32),
+            "actions": np.ones((16, 58), dtype=np.float32),
+        }
+    )
+
+    assert result["action_region_mask"].tolist() == [False, False, True, True]
+
+
 def test_transform_dict():
     # Rename and remove keys.
     input = {"a": {"b": 1, "c": 2}}

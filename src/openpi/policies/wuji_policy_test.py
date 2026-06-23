@@ -59,6 +59,43 @@ def test_wuji_inputs_reject_non_58d_state_and_actions():
         transform(data)
 
 
+def test_wuji_subtask_inputs_map_prompts_and_58d_arrays():
+    data = _example()
+    data["high_prompt"] = b"spray the flowers"
+    data["low_prompt"] = "pump"
+
+    result = wuji_policy.WujiSubtaskInputs(model_type=_model.ModelType.PI05)(data)
+
+    assert set(result["image"]) == {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
+    assert result["state"].shape == (58,)
+    assert result["actions"].shape == (16, 58)
+    assert result["high_prompt"] == "spray the flowers"
+    assert result["low_prompt"] == "pump"
+    assert "prompt" not in result
+
+
+def test_wuji_subtask_prompts_from_indices_accepts_scalar_values():
+    transform = wuji_policy.WujiSubtaskPromptsFromIndices(
+        tasks={0: "spray water"},
+        subtasks={0: "pick up bottle", 1: "pump", 2: "spray"},
+    )
+
+    result = transform({"task_index": np.array(0), "subtask_index": np.array([2])})
+
+    assert result["high_prompt"] == "spray water"
+    assert result["low_prompt"] == "spray"
+
+
+def test_wuji_subtask_prompts_reject_unlabeled_or_unknown_subtask():
+    transform = wuji_policy.WujiSubtaskPromptsFromIndices(tasks={0: "spray water"}, subtasks={0: "pick up bottle"})
+
+    with pytest.raises(ValueError, match="unlabeled"):
+        transform({"task_index": 0, "subtask_index": -1})
+
+    with pytest.raises(ValueError, match="subtask_index=9"):
+        transform({"task_index": 0, "subtask_index": 9})
+
+
 def test_wuji_outputs_return_58d_actions():
     actions = np.ones((16, 60), dtype=np.float32)
 
