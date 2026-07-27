@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.wuji_policy as wuji_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -73,12 +74,16 @@ class DataConfig:
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+    # Optional repack transforms used only by scripts/compute_norm_stats.py.
+    norm_stats_repack_transforms: _transforms.Group | None = None
     # Data transforms, typically include robot specific transformations. Will be applied
     # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
     # normalized data.
     data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Model specific transforms. Will be applied after the data is normalized.
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
+    # Optional data transforms used only by scripts/compute_norm_stats.py.
+    norm_stats_transforms: _transforms.Group | None = None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
@@ -89,6 +94,8 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Timestamp synchronization tolerance for LeRobot datasets.
+    lerobot_tolerance_s: float = 0.0001
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -459,6 +466,66 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotWujiDataConfig(DataConfigFactory):
+    action_dim: int = wuji_policy.WUJI_JOINT_ACTION_DIM
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "head_view": "observation.images.head_view",
+                            "left_wrist_view": "observation.images.left_wrist_view",
+                            "right_wrist_view": "observation.images.right_wrist_view",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if model_config.action_dim != self.action_dim:
+            raise ValueError(
+                f"WUJI data action dimension ({self.action_dim}) must match model action dimension "
+                f"({model_config.action_dim})."
+            )
+        data_transforms = _transforms.Group(
+            inputs=[wuji_policy.WujiInputs(model_type=model_config.model_type, action_dim=self.action_dim)],
+            outputs=[wuji_policy.WujiOutputs(action_dim=self.action_dim)],
+        )
+        norm_stats_transforms = _transforms.Group(inputs=[wuji_policy.WujiNormStatsInputs(action_dim=self.action_dim)])
+        norm_stats_repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            norm_stats_repack_transforms=norm_stats_repack_transform,
+            data_transforms=data_transforms,
+            norm_stats_transforms=norm_stats_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -915,6 +982,35 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_wuji_spray_water_joint_pytorch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=54,
+            action_horizon=32,
+            max_token_len=280,
+        ),
+        data=LeRobotWujiDataConfig(
+            repo_id="/data_all/liyunhao/openpi/data/spray_water_joint_rosbag_ts_filter",
+            assets=AssetsConfig(asset_id="wuji_spray_water_joint"),
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.08),
+            action_dim=54,
+        ),
+        # The dataset stores absolute arm and hand joint targets; do not apply DeltaActions.
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch_converted",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000,
+            peak_lr=2.5e-5,
+            decay_steps=60_000,
+            decay_lr=2.5e-6,
+        ),
+        batch_size=32,
+        num_workers=4,
+        num_train_steps=60_000,
+        log_interval=50,
+        save_interval=4_000,
+        keep_period=5_000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

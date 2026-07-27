@@ -27,6 +27,7 @@ import dataclasses
 import gc
 import logging
 import os
+import pathlib
 import platform
 import shutil
 import time
@@ -45,6 +46,19 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+
+_EXPECTED_SHAPE_MISMATCH_KEYS = {
+    "action_in_proj.weight",
+    "action_out_proj.weight",
+    "action_out_proj.bias",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class ShapeCompatibleLoadResult:
+    loaded: int
+    missing: tuple[str, ...]
+    shape_mismatched: dict[str, tuple[tuple[int, ...], tuple[int, ...]]]
 
 
 def init_logging():
@@ -192,6 +206,65 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # Log checkpoint to wandb
         if config.wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
+
+
+def load_shape_compatible_safetensors(
+    model: torch.nn.Module, model_path: os.PathLike | str
+) -> ShapeCompatibleLoadResult:
+    """Load only safetensors entries whose names and shapes match the current model."""
+    model_path = pathlib.Path(model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Expected PyTorch checkpoint at {model_path}")
+
+    checkpoint_state = safetensors.torch.load_file(model_path)
+    model_state = model.state_dict()
+
+    compatible_state = {}
+    missing = []
+    shape_mismatched = {}
+
+    for key, target_tensor in model_state.items():
+        source_tensor = checkpoint_state.get(key)
+        if source_tensor is None:
+            missing.append(key)
+            continue
+        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            shape_mismatched[key] = (tuple(source_tensor.shape), tuple(target_tensor.shape))
+            continue
+        compatible_state[key] = source_tensor
+
+    if not compatible_state:
+        raise ValueError(f"No tensors loaded from {model_path}; checkpoint parameter names may not match the model.")
+
+    for key, (source_shape, target_shape) in shape_mismatched.items():
+        level = logging.INFO if key in _EXPECTED_SHAPE_MISMATCH_KEYS else logging.WARNING
+        logging.log(
+            level,
+            "Skipped shape-mismatched tensor %s: checkpoint shape=%s model shape=%s",
+            key,
+            source_shape,
+            target_shape,
+        )
+
+    unexpected_mismatches = set(shape_mismatched) - _EXPECTED_SHAPE_MISMATCH_KEYS
+    if unexpected_mismatches:
+        raise ValueError("Unexpected shape-mismatched checkpoint tensors: " + ", ".join(sorted(unexpected_mismatches)))
+
+    model.load_state_dict(compatible_state, strict=False)
+
+    logging.info(
+        "Shape-compatible PyTorch load from %s: loaded=%d missing=%d shape_mismatched=%d",
+        model_path,
+        len(compatible_state),
+        len(missing),
+        len(shape_mismatched),
+    )
+
+    return ShapeCompatibleLoadResult(
+        loaded=len(compatible_state),
+        missing=tuple(missing),
+        shape_mismatched=shape_mismatched,
+    )
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -443,10 +516,13 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        load_result = load_shape_compatible_safetensors(
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            model_path,
         )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        logging.info(
+            "Loaded %d shape-compatible PyTorch tensors from %s", load_result.loaded, config.pytorch_weight_path
+        )
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
