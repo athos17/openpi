@@ -984,7 +984,7 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
-        name="pi05_wuji_spray_water_joint_pytorch",
+        name="pi05_wuji_tactile_vla_joint_absolute_pytorch",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=54,
@@ -992,9 +992,9 @@ _CONFIGS = [
             max_token_len=280,
         ),
         data=LeRobotWujiDataConfig(
-            repo_id="/data_all/liyunhao/openpi/data/spray_water_joint_rosbag_ts_filter",
-            assets=AssetsConfig(asset_id="wuji_spray_water_joint"),
-            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.08),
+            repo_id="/data_all/liyunhao/openpi/data/tactile_vla_teleop_test_joint_absolute_merged",
+            assets=AssetsConfig(asset_id="wuji_tactile_vla_joint_absolute"),
+            base_config=DataConfig(prompt_from_task=True, lerobot_tolerance_s=0.04),
             action_dim=54,
         ),
         # The dataset stores absolute arm and hand joint targets; do not apply DeltaActions.
